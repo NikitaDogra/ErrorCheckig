@@ -1,5 +1,6 @@
 library(data.table)
-
+library(tidyverse)
+library(tidymodels)
 
 sqlserverconnectionstring <- "SERVER=ccgehsql04;DATABASE=QuotesEngine;UID=reserving;PWD=1q2w3e4rQWE123;"
 
@@ -141,13 +142,68 @@ exposure[, PurchaseDate := as.Date(PurchaseDate,"%d/%m/%Y")]
 exposure[,YearsOwnedVehicle := as.numeric(UW_dt - PurchaseDate)/365.25]
 exposure[,MaxPossibleNCD := floor(YearsOwnedVehicle)]
 exposure[,NCD_Difference := MaxPossibleNCD - YearsNCDAllowed]
-exposure[,D2_Older := fcase(is.na(D2_Age),"Not Applicable",
-                            D2_Age > proposer_age, "Yes",
-                            default = "No")]
+exposure[,D2_Older := lest::case_when(
+  is.na(D2_Age) ~"Not Applicable",
+  D2_Age > proposer_age ~ "Yes",
+  TRUE ~ "No")]
+
 exposure[,`Excess/Value` := Excess/Value]
 
 exposure[,AgeGotLicense :=proposer_age - LICmnths_PPSR/12]
 exposure[,Model2 := gsub( " .*$", "",Model)]
+
+
+# add in all  the features Ian mentions he looks at here 
+
+#PC high annual Mileage
+exposure$"PC_annual_mileage" <- ifelse(exposure$Business=="P/CAR" & exposure$AnnualMileage>20000,TRUE,FALSE)
+
+#CV Courier and low annual mileage
+exposure$"CV_Courier_Low_Mileage" <- ifelse(exposure$Business=="CV" & exposure$AnnualMileage<12000 & exposure$OCC_DESC_PPSR %in% c(
+  
+  "Courier"  
+  ,"Courier - Parcel Delivery"
+  , "Delivery Courier" 
+  , "Delivery Rounds Person"
+  , "Courier - Driver" 
+  , "Delivery Driver"),TRUE,FALSE)
+
+#CV vehicles Garaged 
+exposure$"CV_Veh_Garaged" <- ifelse(exposure$Business=="CV" & exposure$Veh_Stor=="Garage",TRUE,FALSE)
+
+#Young but retired 
+exposure$"Young_But_Retired" <- ifelse(exposure$OCC_DESC_PPSR=="Retired" & exposure$proposer_age<50,TRUE,FALSE)
+
+#House Husbands
+exposure$"House Husband" <- ifelse(exposure$Sex_PPSR=="M" & exposure$OCC_DESC_PPSR %in% c("Househusband" ,"Houseman or Woman" 
+                                                                                          ,"House Parent" 
+                                                                                          , "Housekeeper" 
+                                                                                          , "Houseperson (Housewife or Househusband)"),TRUE,FALSE)
+
+#Fronting
+exposure$"Fronting" <- ifelse(exposure$D2_Age<30 & (exposure$proposer_age-exposure$D2_Age)>=20,TRUE,FALSE)
+
+
+
+exposure %>% left_join(exposure %>% 
+                         group_by(veh_age) %>% 
+                         summarise(Value_50th_perc = quantile(Value,0.5),
+                                   Value_25th_perc = quantile(Value,0.25),
+                                   Value_75th_perc = quantile(Value,0.75)),
+                                   by = "veh_age") %>% glimpse()
+
+#Low value new vehicles
+exposure$"Low_Value_But_New" <- ifelse(exposure$veh_age < 10 & exposure$Value < Value_25th_perc & exposure$Value > Value_75th_perc , TRUE,FALSE)
+
+
+#Vehcile ownership with no ncd or claims
+exposure$"Owned_But_no_ncd_or_claims" <- ifelse(exposure$owner=="Proposer/Policyholder" & exposure$YearsNcd == 0 & exposure$CLM_CNT ==0 , TRUE,FALSE)
+
+#International licences with residency over 12 months
+
+
+#Low declared annual mileages, particularly when not SD&P only use.
+
 
 
 exposure %>% 
@@ -155,18 +211,41 @@ exposure %>%
   mutate(across(Accident_N:Z0,
                 .fns = ~ifelse(is.na(.x),0,.x))) -> exposure
 
-# Modeling ----------------------------------------------------------------
 
-library(tidymodels)
+exposure %>% 
+  mutate(NrOfRiskIndicatorsFound = PC_annual_mileage + CV_Courier_Low_Mileage + 
+           CV_Veh_Garaged + Young_But_Retired + 
+           `House Husband` + Fronting+ Low_Value_But_New) -> exposure 
+
+
+summarise(across(c(PC_annual_mileage:Low_Value_But_New),function(x){sum(x)}))
+
+# Modeling ----------------------------------------------------------------
+library(readxl)
+BadPolicyTable <- read_excel("R:/Share/Projects/ErrorCheckig/Post Bind Report.xls")
+badpolicies <- sub(".*No:","",BadPolicyTable$"Reference")
+badpolicies<-trimws(badpolicies)
+
+
+# create a new dataframe to store all the bad policies
+
+ exposure %>% filter(PolicyNo %in% badpolicies) -> bad_policies 
+
+ `%notin%` <- Negate(`%in%`)
+ 
+# exposure <- exposure %>% filter(PolicyNo %notin% badpolicies)
+
 
 # split the data into training/holdout 
-
-training <- exposure %>% filter(UW_dt <= Sys.Date()-14)
+training <- e=xposure %>% filter(UW_dt <= Sys.Date()-14)
 holdout <- exposure %>% filter(UW_dt > Sys.Date()-14)
 
 
 
 # recipe for modeling 
+isbad_fn <- function(x){ifelse(is.na(x),1,0)}
+
+
 
 rec <- recipe(GWP ~ 
                 Business +
@@ -221,9 +300,15 @@ rec <- recipe(GWP ~
                 AgeGotLicense,
               data = training
                 ) %>% 
+  step_mutate_at(all_numeric(),
+                fn = list(isBad = isbad_fn)) %>%
   step_meanimpute(all_numeric()) %>% 
   step_modeimpute(all_nominal()) %>% 
   step_mutate(GWP_per_Value = GWP/Value,
+              GWP_per_age = GWP/proposer_age,
+              GWP_per_veh_age = GWP/veh_age,
+              
+              GWP_per_youngest_age = GWP/youngest_age,
               AgeDiff = proposer_age - youngest_age) %>% 
   step_other(all_nominal(), threshold = 0.01) %>% 
   prep()
@@ -245,7 +330,7 @@ isoforst <- h2o.isolationForest(
   min_rows = 5
 )
 
-preds <- h2o.predict(isoforst, newdata = holdout.h)
+preds <- h2o.predict(isoforst, newdata = holdout.h,use_datatable  = T)
 
 as.data.frame(preds)$predict -> estimated
 
@@ -255,6 +340,25 @@ holdout$Estimated <- estimated
 holdout %>%
   mutate(AtRisk = ifelse(Estimated > quantile(Estimated,0.99),1,0)) -> holdout
 
+
+holdout %>% 
+  filter(AtRisk > 0) %>% 
+  select(PolicyNo,
+           Business,
+           Cover,
+           Pay_Desc,
+           PC_Region,
+           PC_Town,
+           proposer_age,
+           youngest_age,
+           D2_Age,
+           LIC_TYPE_PPSR:OCC_DESC_PPSR,
+           Date_resident_D1:Sex_D2,
+           veh_age:Value,
+           Veh_Stor:GWP,
+           Supergroup:Other_Y) %>% 
+  View()
+  fwrite(.,"Sample1.csv")
 
 # holdout.h$Anomaly[holdout.h$PolicyNo == "3216150001556"] <- 1
 
@@ -267,6 +371,9 @@ which(holdout$AtRisk > 0)
 holdout_prepped$AtRisk <- "N"
 holdout_prepped$AtRisk[which(holdout$AtRisk > 0)] <- "Y"
 
+
+holdout %>% filter(AtRisk == 1) %>% View()
+
 # 
 # 
 # # local model 
@@ -277,6 +384,10 @@ holdout_prepped$AtRisk[which(holdout$AtRisk > 0)] <- "Y"
 #                              training_frame = holdout.h2,
 #                              ntrees = 1,
 #                              max_depth = 5)
+
+# TODO: get a list of all problematic policies from ian and exclude those from the training data 
+# TODO: get a list of manual checks Ian and the underwriters apply and include those as columns in the data 
+# TODO: 
 
 library(party)
 
