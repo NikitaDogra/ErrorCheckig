@@ -2,6 +2,11 @@ library(data.table)
 library(tidyverse)
 library(tidymodels)
 
+
+library(usethis)
+use_git_config(user.name = "NikitaDogra", user.email = "nikita.dogra@mulsanneinsurance.com")
+
+
 sqlserverconnectionstring <- "SERVER=ccgehsql04;DATABASE=QuotesEngine;UID=reserving;PWD=1q2w3e4rQWE123;"
 
 
@@ -193,7 +198,7 @@ exposure %>% left_join(exposure %>%
                                    by = "veh_age") %>% glimpse()
 
 #Low value new vehicles
-exposure$"Low_Value_But_New" <- ifelse(exposure$veh_age < 10 & exposure$Value < Value_25th_perc & exposure$Value > Value_75th_perc , TRUE,FALSE)
+exposure$"Low_Value_But_New" <- ifelse(exposure$veh_age < 10 & (exposure$Value < exposure$Value_25th_perc | exposure$Value > exposure$Value_75th_perc) , TRUE,FALSE)
 
 
 #Vehcile ownership with no ncd or claims
